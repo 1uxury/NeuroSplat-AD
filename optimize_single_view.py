@@ -7,7 +7,7 @@ from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 from plyfile import PlyData, PlyElement
-
+import open3d as o3d
 # 引入 gsplat (pip install gsplat)
 from gsplat import rasterization
 
@@ -40,101 +40,167 @@ def save_gaussian_ply(path, means, colors, scales, quats, opacities):
 
 
 def optimize_single_bagel(tiff_path, rgb_path, output_ply_path, iterations=300):
-    # 1. 读取基础数据 (Ground Truth)
+    # 1. 读取基础数据
     xyz_map = tifffile.imread(tiff_path)
     rgb_map = np.array(Image.open(rgb_path)) / 255.0
     H, W = rgb_map.shape[:2]
 
-    # 展平并过滤无效背景点 (MVTec 中无效深度通常是 0)
-    pts = xyz_map.reshape(-1, 3)
-    colors = rgb_map.reshape(-1, 3)
-    valid_mask = pts[:, 2] > 0.001 
+    pts_flat = xyz_map.reshape(-1, 3)
+    colors_flat = rgb_map.reshape(-1, 3)
+    valid_mask_1d = pts_flat[:, 2] > 0.001
     
-    gt_pts = pts[valid_mask]
-    gt_colors = colors[valid_mask]
+    # 2. 复用你的完美 RANSAC 清洗
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts_flat[valid_mask_1d])
+    pcd.colors = o3d.utility.Vector3dVector(colors_flat[valid_mask_1d])
     
-    if len(gt_pts) == 0:
-        return
+    if len(pcd.points) == 0: return
 
-    # 将 Ground Truth 转为 Tensor，准备计算 Loss
+    plane_model, inliers = pcd.segment_plane(distance_threshold=0.003, ransac_n=3, num_iterations=1000)
+    dists = pcd.compute_point_cloud_distance(pcd.select_by_index(inliers))
+    dists = np.asarray(dists)
+    
+    bagel_idx_in_valid = np.where(dists > 0.001)[0]
+    bagel_pcd = pcd.select_by_index(bagel_idx_in_valid)
+    bagel_pcd, sor_indices = bagel_pcd.remove_statistical_outlier(nb_neighbors=100, std_ratio=2.5)
+    
+    gt_pts = np.asarray(bagel_pcd.points)
+    gt_colors = np.asarray(bagel_pcd.colors)
+    
+    if len(gt_pts) == 0: return
+
+    # 3. 获取只属于贝果本体的 Mask
+    foreground_mask_flat = np.zeros(H * W, dtype=bool)
+    valid_indices = np.where(valid_mask_1d)[0]
+    bagel_absolute_indices = valid_indices[bagel_idx_in_valid][sor_indices]
+    foreground_mask_flat[bagel_absolute_indices] = True
+    foreground_mask_2d = torch.tensor(foreground_mask_flat.reshape(H, W), device=DEVICE)
+    
     gt_rgb_tensor = torch.tensor(rgb_map, dtype=torch.float32, device=DEVICE)
-    # 提取深度通道作为 GT
     gt_depth_tensor = torch.tensor(xyz_map[..., 2], dtype=torch.float32, device=DEVICE)
 
-    # 2. 初始化高斯参数
+    # 4. 相机矩阵计算
+    X = gt_pts[:, 0]
+    Z = gt_pts[:, 2]
+    cx, cy = W / 2.0, H / 2.0
+    u_idx = bagel_absolute_indices % W
+    valid_x = np.abs(X) > 0.01 
+    focal_x = float(np.median(np.abs((u_idx[valid_x] - cx) * Z[valid_x] / X[valid_x]))) if np.sum(valid_x) > 0 else 5000.0
+
+    K = torch.tensor([[focal_x, 0, cx], [0, focal_x, cy], [0, 0, 1]], dtype=torch.float32, device=DEVICE)
+    viewmat = torch.eye(4, dtype=torch.float32, device=DEVICE)
+
     num_points = len(gt_pts)
-    means = torch.tensor(gt_pts, dtype=torch.float32, device=DEVICE).requires_grad_(True)
-    colors_p = torch.tensor(gt_colors, dtype=torch.float32, device=DEVICE).requires_grad_(True)
-    # 初始化为一个较小的各向同性体积 (基于 MVTec 的物理尺度，比如 1mm)
-    scales = torch.full((num_points, 3), -5.0, dtype=torch.float32, device=DEVICE).requires_grad_(True)
-    # 初始化为单位四元数 [w, x, y, z]
+    init_scale = float(np.log(max((np.max(X) - np.min(X)) / W, 1e-5)))
+    colors_logit = np.log(np.clip(gt_colors, 1e-4, 1 - 1e-4) / (1 - np.clip(gt_colors, 1e-4, 1 - 1e-4)))
+
+    # ==========================================
+    # 【核心：彻底冻结 XYZ，去除一切多余惩罚】
+    # ==========================================
+    means = torch.tensor(gt_pts, dtype=torch.float32, device=DEVICE).requires_grad_(False) # 绝对锁死！
+    
+    colors_p = torch.tensor(colors_logit, dtype=torch.float32, device=DEVICE).requires_grad_(True)
+    scales = torch.full((num_points, 3), init_scale, dtype=torch.float32, device=DEVICE).requires_grad_(True)
     quats = torch.zeros((num_points, 4), dtype=torch.float32, device=DEVICE)
     quats[:, 0] = 1.0
     quats.requires_grad_(True)
-    # 初始化透明度 (经过 sigmoid 激活前的值)
-    opacities = torch.zeros((num_points, 1), dtype=torch.float32, device=DEVICE).requires_grad_(True)
+    opacities = torch.full((num_points, 1), 2.0, dtype=torch.float32, device=DEVICE).requires_grad_(True)
 
-    # 3. 设置虚拟相机 (正交近似：将焦距设得极大，模拟工业相机的垂直俯拍)
-    focal = 10000.0 
-    K = torch.tensor([[focal, 0, W/2], [0, focal, H/2], [0, 0, 1]], dtype=torch.float32, device=DEVICE)
-    viewmat = torch.eye(4, dtype=torch.float32, device=DEVICE)
-
-    # 4. 优化器设置
     optimizer = torch.optim.Adam([
-        {'params': [means], 'lr': 0.0001, "name": "xyz"},      # 位置微调
-        {'params': [colors_p], 'lr': 0.005, "name": "color"},  # 颜色
-        {'params': [scales], 'lr': 0.005, "name": "scale"},    # 核心：形状形变
-        {'params': [quats], 'lr': 0.001, "name": "quat"},      # 核心：旋转姿态
-        {'params': [opacities], 'lr': 0.05, "name": "opacity"} # 透明度
+        {'params': [colors_p], 'lr': 0.01, "name": "color"},
+        {'params': [scales], 'lr': 0.005, "name": "scale"},
+        {'params': [quats], 'lr': 0.005, "name": "quat"},
+        {'params': [opacities], 'lr': 0.01, "name": "opacity"}
     ])
 
-    # 5. 训练循环
     for step in range(iterations):
         optimizer.zero_grad()
 
-        # 激活参数
         act_scales = torch.exp(scales)
         act_quats = F.normalize(quats, p=2, dim=-1)
         act_opacities = torch.sigmoid(opacities)
         act_colors = torch.sigmoid(colors_p)
 
-        # 渲染 RGB 和 Depth
         renders, _, _ = rasterization(
-            means=means,
-            quats=act_quats,
-            scales=act_scales,
-            opacities=act_opacities.squeeze(-1),
-            colors=act_colors,
-            viewmats=viewmat.unsqueeze(0),
-            Ks=K.unsqueeze(0),
-            width=W,
-            height=H,
-            render_mode="RGB+ED" # 渲染 RGB 和 Expected Depth
+            means=means, quats=act_quats, scales=act_scales, opacities=act_opacities.squeeze(-1),
+            colors=act_colors, viewmats=viewmat.unsqueeze(0), Ks=K.unsqueeze(0), width=W, height=H, render_mode="RGB+ED"
         )
         
         render_rgb = renders[0, ..., :3]
         render_depth = renders[0, ..., 3]
 
-        # 计算 Loss：强迫高斯变形以填补裂纹和表面凹凸
-        loss_rgb = F.l1_loss(render_rgb, gt_rgb_tensor)
-        
-        # 只在有物体的区域计算深度 Loss
-        mask = gt_depth_tensor > 0.001
-        loss_depth = F.l1_loss(render_depth[mask], gt_depth_tensor[mask])
+        # 最纯粹的损失：只算贝果上的点，微微压制一下 Scale，其余全靠优化器自由发挥
+        loss_rgb = F.l1_loss(render_rgb[foreground_mask_2d], gt_rgb_tensor[foreground_mask_2d])
+        loss_depth = F.l1_loss(render_depth[foreground_mask_2d], gt_depth_tensor[foreground_mask_2d])
+        loss_scale = torch.mean(act_scales)
 
-        # 联合 Loss，深度占主导地位，因为异常检测最看重几何形变
-        total_loss = loss_rgb + 2.0 * loss_depth
-
+        total_loss = loss_rgb + 0.5 * loss_depth + 0.1 * loss_scale
         total_loss.backward()
         optimizer.step()
 
-    # 6. 保存带有真实形变参数的 3DGS 点云
     save_gaussian_ply(output_ply_path, means, torch.sigmoid(colors_p), scales, F.normalize(quats, p=2, dim=-1), opacities)
 
-
 if __name__ == "__main__":
-    # 使用你之前 3d.py 中的遍历逻辑，把对 create_faithful_ply 的调用
-    # 替换为对 optimize_single_bagel(tiff_path, rgb_path, output_ply_path) 的调用
-    # 下面是一个测试单例：
-    # optimize_single_bagel("test_xyz.tiff", "test_rgb.png", "output_gaussian.ply")
-    print("准备就绪，可以开始批量 3DGS 拟合...")
+    # 1. 设定根目录 (保持你原本 3d.py 里的路径配置)
+    DATASET_ROOT = r"F:/download/mvtec_3d_anomaly_detection"
+    CATEGORY = "bagel"
+    # 【建议】换一个新的输出文件夹名字，比如加上 _optimized，以免和你之前生成的普通点云混淆
+    OUTPUT_ROOT = r"F:/download/LGM-main/LGM-main/gaussian_data_optimized" 
+
+    # MVTec 3D-AD 包含 train, validation 和 test 文件夹
+    category_dir = Path(DATASET_ROOT) / CATEGORY
+    
+    print(f"🚀 开始批量 3DGS 拟合处理类别: {CATEGORY}")
+    
+    # 2. 遍历 category 下的所有子文件夹 (train, validation, test)
+    for split_dir in category_dir.iterdir():
+        if not split_dir.is_dir():
+            continue
+            
+        # 3. 遍历 split 下的具体分类 (good, crack, hole, combined 等)
+        for type_dir in split_dir.iterdir():
+            if not type_dir.is_dir():
+                continue
+                
+            xyz_dir = type_dir / "xyz"
+            rgb_dir = type_dir / "rgb"
+            
+            # 确保这不是一个空文件夹
+            if not xyz_dir.exists() or not rgb_dir.exists():
+                continue
+                
+            # 4. 在输出目录中镜像创建同样的文件夹结构
+            out_dir = Path(OUTPUT_ROOT) / CATEGORY / split_dir.name / type_dir.name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 5. 扫描所有的tiff文件并处理
+            tiff_files = sorted(list(xyz_dir.glob("*.tiff")))
+            
+            # 使用 tqdm进度条
+            with tqdm(total=len(tiff_files), desc=f"{split_dir.name}/{type_dir.name}", unit="file") as pbar:
+                for tiff_path in tiff_files:
+                    # 寻找同名的rgb图片
+                    rgb_path = rgb_dir / f"{tiff_path.stem}.png"
+                    
+                    # 兼容部分扩展名大写的情况
+                    if not rgb_path.exists():
+                        rgb_path = rgb_dir / f"{tiff_path.stem}.PNG"
+                        
+                    if rgb_path.exists():
+                        output_ply_path = out_dir / f"{tiff_path.stem}.ply"
+                        
+                        # 增加断点保护：如果这个文件已经生成过了，就跳过
+                        if not output_ply_path.exists():
+                            # ==========================================
+                            # 【这里的核心发生了改变】
+                            # 不再是简单的 create_faithful_ply，而是调用我们刚写的 3DGS 联合优化！
+                            # ==========================================
+                            optimize_single_bagel(str(tiff_path), str(rgb_path), str(output_ply_path), iterations=300)
+                        else:
+                            pbar.set_postfix({'skip': output_ply_path.name})
+                    else:
+                        pbar.set_postfix({'error': f"RGB not found for {tiff_path.stem}"})
+                    
+                    pbar.update(1)
+
+    print("\n✅ 批量 3DGS 拟合处理完成!")
