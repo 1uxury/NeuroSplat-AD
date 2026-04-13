@@ -17,25 +17,37 @@ NUM_POINTS = 4096
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # =======================================
 
-def chamfer_score_symmetric(x, y, top_k_ratio=0.10):
+def feature_aware_chamfer_score(x, y, top_k_ratio=0.10):
     """
-    计算双向异常分数，取前 10% 的极值误差以兼顾抗噪和敏感度。
+    【特征感知异常打分】：提取前 10% 参数畸变最严重的点作为异常分数
     """
-    # 同样必须只取前 3 维计算距离！
-    x_xyz = x[:, :3, :].transpose(1, 2) 
-    y_xyz = y[:, :3, :].transpose(1, 2)
+    x_t = x.transpose(1, 2)
+    y_t = y.transpose(1, 2)
     
-    dist_mat = torch.cdist(x_xyz, y_xyz)
-    min_dist_x, _ = torch.min(dist_mat, dim=2) 
-    min_dist_y, _ = torch.min(dist_mat, dim=1) 
+    x_xyz = x_t[:, :, :3]
+    y_xyz = y_t[:, :, :3]
+    dist_mat = torch.cdist(x_xyz, y_xyz, p=2)
     
-    num_points = min_dist_x.shape[1]
+    _, min_idx_x2y = torch.min(dist_mat, dim=2)
+    _, min_idx_y2x = torch.min(dist_mat, dim=1)
+    
+    num_dims = x_t.shape[2]
+    idx_x2y_expanded = min_idx_x2y.unsqueeze(-1).expand(-1, -1, num_dims)
+    y_matched = torch.gather(y_t, 1, idx_x2y_expanded)
+    
+    idx_y2x_expanded = min_idx_y2x.unsqueeze(-1).expand(-1, -1, num_dims)
+    x_matched = torch.gather(x_t, 1, idx_y2x_expanded)
+    
+    # 计算每个点在 14 维上的平均误差
+    error_x = torch.mean(torch.abs(x_t - y_matched), dim=-1) # (B, N)
+    error_y = torch.mean(torch.abs(y_t - x_matched), dim=-1) # (B, N)
+    
+    num_points = error_x.shape[1]
     k = max(1, int(num_points * top_k_ratio))
     
-    topk_x, _ = torch.topk(min_dist_x, k, dim=1)
-    topk_y, _ = torch.topk(min_dist_y, k, dim=1)
+    topk_x, _ = torch.topk(error_x, k, dim=1)
+    topk_y, _ = torch.topk(error_y, k, dim=1)
     
-    # 只要 Input多出异物(x) 或 Recon缺失实体(y)，取其最大值报警
     return max(torch.mean(topk_x).item(), torch.mean(topk_y).item())
 
 if __name__ == "__main__":
