@@ -67,15 +67,33 @@ def main():
         functional.reset_net(model)
         recon = model(data)
         
-        # 安全提取前3维 (XYZ 坐标)
-        x = data.narrow(dim=1, start=0, length=3).transpose(1, 2)
-        y = recon.narrow(dim=1, start=0, length=3).transpose(1, 2)
+        # 1. 维度转换 (B, 14, N) -> (B, N, 14)
+        x_t = data.transpose(1, 2)    
+        y_t = recon.transpose(1, 2)   
         
-        # 计算距离矩阵
-        dist_mat = torch.cdist(x, y)
+        # 2. 仅依靠前 3 维(XYZ)计算物理空间的距离矩阵
+        x_xyz = x_t[:, :, :3]
+        y_xyz = y_t[:, :, :3]
+        dist_mat = torch.cdist(y_xyz, x_xyz, p=2) 
         
-        # 【核心逻辑】：只保留 Recon -> Input 的误差，专门捕捉“缺失的裂纹”
-        error_y = torch.min(dist_mat, dim=1).values.squeeze().cpu().numpy()
+        # 3. 找到重构体 y 上每个点对应的输入体 x 的最近物理点
+        _, min_idx_y2x = torch.min(dist_mat, dim=2)
+        
+        # 4. 根据索引拉取输入点云的 14 维真实特征
+        num_dims = x_t.shape[2]
+        idx_y2x_expanded = min_idx_y2x.unsqueeze(-1).expand(-1, -1, num_dims)
+        x_matched = torch.gather(x_t, 1, idx_y2x_expanded)
+        
+        # 5. 热力图依据：全面评估 3DGS 参数的畸变程度！
+        # 权重分配：XYZ(1.0), RGB(0.5), Scale(2.0), Rotation(1.0), Opacity(1.0)
+        weights = torch.tensor([1.0]*3 + [0.5]*3 + [2.0]*3 + [1.0]*4 + [1.0]*1, device=DEVICE)
+        
+        # 计算 14 维加权绝对误差
+        diff = torch.abs(y_t - x_matched) * weights
+        error_y = torch.mean(diff, dim=-1).squeeze().cpu().numpy()
+        
+        # 获取用于最终绘图的 3D 坐标
+        raw_points_recon = y_xyz.squeeze().cpu().numpy()
 
     # 3. 对误差进行 3D 高斯平滑
     raw_points_recon = y.squeeze().cpu().numpy()
