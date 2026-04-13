@@ -91,7 +91,7 @@ if __name__ == "__main__":
                 functional.reset_net(model)
                 recon = model(data)
                 
-                score = chamfer_score_symmetric(data, recon)
+                score = feature_aware_chamfer_score(data, recon)
                 
                 y_true.append(label)
                 y_scores.append(score)
